@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,6 +29,11 @@ type ServiceInstance struct {
 
 	startErrFn func() error
 	waitErrFn  func() error
+
+	// portListeners holds the manager's SO_REUSEPORT listeners for this service.
+	// They are closed once the service becomes healthy, releasing the port back
+	// to be exclusively owned by the service.
+	portListeners []net.Listener
 
 	mu                   sync.Mutex
 	runErr               error
@@ -100,6 +106,7 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 
 		if s.HealthCheck(ctx, expectedStartDuration) {
 			log.Printf("%s healthy!\n", coloredLabel)
+			s.releasePortListeners()
 			break
 		}
 
@@ -107,6 +114,15 @@ func (s *ServiceInstance) WaitUntilHealthy(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (s *ServiceInstance) releasePortListeners() {
+	for _, l := range s.portListeners {
+		if err := l.Close(); err != nil {
+			log.Printf("Warning: failed to close port listener for %s: %v", s.Colorize(s.Label), err)
+		}
+	}
+	s.portListeners = nil
 }
 
 var httpClient = http.Client{

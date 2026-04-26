@@ -118,7 +118,7 @@ func main() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	must(err)
 
-	ports, err := assignPorts(unversionedSpecs)
+	ports, reuseportListeners, err := assignPorts(unversionedSpecs)
 	must(err)
 
 	svcctlPort := listener.Addr().(*net.TCPAddr).Port
@@ -137,7 +137,7 @@ func main() {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	defer cancelFunc()
 
-	r, err := runner.New(ctx, serviceSpecs)
+	r, err := runner.New(ctx, serviceSpecs, reuseportListeners)
 	must(err)
 
 	servicesErrCh := make(chan error, len(unversionedSpecs))
@@ -354,9 +354,10 @@ func readServiceSpecs(
 func assignPorts(
 	serviceSpecs map[string]svclib.ServiceSpec,
 ) (
-	svclib.Ports, error,
+	svclib.Ports, map[string][]net.Listener, error,
 ) {
 	var toClose []net.Listener
+	reuseportListeners := map[string][]net.Listener{}
 	ports := svclib.Ports{}
 
 	for label, spec := range serviceSpecs {
@@ -389,11 +390,11 @@ func assignPorts(
 
 			listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			_, port, err = net.SplitHostPort(listener.Addr().String())
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
 			qualifiedPortName := label
@@ -423,6 +424,8 @@ func assignPorts(
 
 			if !spec.SoReuseportAware {
 				toClose = append(toClose, listener)
+			} else {
+				reuseportListeners[label] = append(reuseportListeners[label], listener)
 			}
 		}
 	}
@@ -430,7 +433,7 @@ func assignPorts(
 	for _, listener := range toClose {
 		err := listener.Close()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -461,10 +464,10 @@ func assignPorts(
 
 	serializedPorts, err := ports.Marshal()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	os.Setenv("ASSIGNED_PORTS", string(serializedPorts))
-	return ports, nil
+	return ports, reuseportListeners, nil
 }
 
 func augmentServiceSpecs(

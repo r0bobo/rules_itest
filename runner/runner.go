@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"reflect"
@@ -32,12 +33,14 @@ type Runner struct {
 	serviceSpecs ServiceSpecs
 
 	serviceInstances map[string]*ServiceInstance
+	portListeners    map[string][]net.Listener
 }
 
-func New(ctx context.Context, serviceSpecs ServiceSpecs) (*Runner, error) {
+func New(ctx context.Context, serviceSpecs ServiceSpecs, portListeners map[string][]net.Listener) (*Runner, error) {
 	r := &Runner{
 		ctx:              ctx,
 		serviceInstances: map[string]*ServiceInstance{},
+		portListeners:    portListeners,
 	}
 	err := r.UpdateSpecs(serviceSpecs, nil)
 	if err != nil {
@@ -194,6 +197,9 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 		r.serviceInstances[label], err = prepareServiceInstance(r.ctx, serviceSpecs[label])
 		if err != nil {
 			return err
+		}
+		if listeners, ok := r.portListeners[label]; ok {
+			r.serviceInstances[label].portListeners = listeners
 		}
 	}
 

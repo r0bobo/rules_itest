@@ -28,19 +28,57 @@ var terseOutput = os.Getenv("SVCINIT_TERSE_OUTPUT") == "True"
 
 type ServiceSpecs = map[string]svclib.VersionedServiceSpec
 
+// ReuseportListenFn produces a fresh SO_REUSEPORT-aware listener bound to addr.
+// Injected so the runner stays platform-agnostic (the actual SO_REUSEPORT
+// sockopt setup lives in cmd/svcinit).
+type ReuseportListenFn func(addr string) (net.Listener, error)
+
 type Runner struct {
 	ctx          context.Context
 	serviceSpecs ServiceSpecs
 
 	serviceInstances map[string]*ServiceInstance
-	portListeners    map[string][]net.Listener
+
+	// portsMu guards portListeners. StartAll releases listeners from the
+	// per-service worker goroutines (topological runner, parallel), so even
+	// though writes to different keys, the map itself needs serialization.
+	portsMu sync.Mutex
+	// portListeners holds open SO_REUSEPORT listeners keyed by service label.
+	// On startup the runner inherits listeners from the bootstrap port-assignment
+	// pass; they are closed once the service becomes healthy, releasing the
+	// port back to be exclusively owned by the service. Across an ibazel
+	// restart of a SO_REUSEPORT-aware service we rebind on the same addresses
+	// before stopping the old instance, so the port can't be stolen during the
+	// gap between Stop and Start (the "baton pass").
+	portListeners map[string][]net.Listener
+
+	// reuseportAddrs preserves the addresses originally bound for each
+	// SO_REUSEPORT-aware service so the runner can rebind across a restart
+	// even after the original listeners were released. Written once in New;
+	// read-only thereafter.
+	reuseportAddrs map[string][]string
+
+	reuseportListenFn ReuseportListenFn
 }
 
-func New(ctx context.Context, serviceSpecs ServiceSpecs, portListeners map[string][]net.Listener) (*Runner, error) {
+func New(
+	ctx context.Context,
+	serviceSpecs ServiceSpecs,
+	portListeners map[string][]net.Listener,
+	reuseportListenFn ReuseportListenFn,
+) (*Runner, error) {
+	addrs := make(map[string][]string, len(portListeners))
+	for label, ls := range portListeners {
+		for _, l := range ls {
+			addrs[label] = append(addrs[label], l.Addr().String())
+		}
+	}
 	r := &Runner{
-		ctx:              ctx,
-		serviceInstances: map[string]*ServiceInstance{},
-		portListeners:    portListeners,
+		ctx:               ctx,
+		serviceInstances:  map[string]*ServiceInstance{},
+		portListeners:     portListeners,
+		reuseportAddrs:    addrs,
+		reuseportListenFn: reuseportListenFn,
 	}
 	err := r.UpdateSpecs(serviceSpecs, nil)
 	if err != nil {
@@ -91,7 +129,11 @@ func (r *Runner) StartAll(serviceErrCh chan error) ([]topological.Task, error) {
 			ctx = timeoutCtx
 			defer cancel()
 		}
-		return service.WaitUntilHealthy(ctx)
+		if err := service.WaitUntilHealthy(ctx); err != nil {
+			return err
+		}
+		r.releasePortListeners(service.Label)
+		return nil
 	})
 	starter := topological.NewRunner(tasks)
 	err := starter.Run(r.ctx)
@@ -183,10 +225,22 @@ func computeUpdateActions(currentServices, newServices ServiceSpecs) updateActio
 func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error {
 	updateActions := computeUpdateActions(r.serviceSpecs, serviceSpecs)
 
+	willRestart := make(map[string]struct{}, len(updateActions.toStartLabels))
+	for _, label := range updateActions.toStartLabels {
+		willRestart[label] = struct{}{}
+	}
+
 	for _, label := range updateActions.toStopLabels {
 		serviceInstance := r.serviceInstances[label]
 		if serviceInstance.Type == "group" {
 			continue
+		}
+		// Baton-pass: if this service is being restarted (not removed) and we
+		// already released its SO_REUSEPORT listeners after a previous healthy,
+		// rebind on the original addresses now -- before stopping the old
+		// process -- so the port can't be stolen during the restart gap.
+		if _, ok := willRestart[label]; ok {
+			r.rebindPortListeners(label)
 		}
 		serviceInstance.Stop()
 		delete(r.serviceInstances, label)
@@ -197,9 +251,6 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 		r.serviceInstances[label], err = prepareServiceInstance(r.ctx, serviceSpecs[label])
 		if err != nil {
 			return err
-		}
-		if listeners, ok := r.portListeners[label]; ok {
-			r.serviceInstances[label].portListeners = listeners
 		}
 	}
 
@@ -212,6 +263,56 @@ func (r *Runner) UpdateSpecs(serviceSpecs ServiceSpecs, ibazelCmd []byte) error 
 
 	r.serviceSpecs = serviceSpecs
 	return nil
+}
+
+// releasePortListeners closes any SO_REUSEPORT listeners the runner is holding
+// for label and clears the entry. Safe to call when nothing is held.
+func (r *Runner) releasePortListeners(label string) {
+	r.portsMu.Lock()
+	listeners := r.portListeners[label]
+	delete(r.portListeners, label)
+	r.portsMu.Unlock()
+
+	for _, l := range listeners {
+		if err := l.Close(); err != nil {
+			log.Printf("Warning: failed to close port listener for %s: %v", label, err)
+		}
+	}
+}
+
+// rebindPortListeners reopens SO_REUSEPORT listeners on the originally-bound
+// addresses for label, but only if we no longer hold them (i.e. they were
+// released after the prior healthy). No-op when there's nothing to rebind --
+// e.g. non-SO_REUSEPORT services, or restarts where the previous boot never
+// reached healthy and we are still holding the listeners.
+func (r *Runner) rebindPortListeners(label string) {
+	r.portsMu.Lock()
+	alreadyHeld := len(r.portListeners[label]) > 0
+	r.portsMu.Unlock()
+	if alreadyHeld {
+		return
+	}
+	addrs := r.reuseportAddrs[label]
+	if len(addrs) == 0 || r.reuseportListenFn == nil {
+		return
+	}
+	listeners := make([]net.Listener, 0, len(addrs))
+	for _, addr := range addrs {
+		l, err := r.reuseportListenFn(addr)
+		if err != nil {
+			// Most likely some non-SO_REUSEPORT process snuck in and grabbed
+			// the port during the gap since release. Warn and continue with
+			// whatever we managed to rebind -- this is no worse than today.
+			log.Printf("Warning: failed to rebind port listener for %s on %s: %v", label, addr, err)
+			continue
+		}
+		listeners = append(listeners, l)
+	}
+	if len(listeners) > 0 {
+		r.portsMu.Lock()
+		r.portListeners[label] = listeners
+		r.portsMu.Unlock()
+	}
 }
 
 func (r *Runner) UpdateSpecsAndRestart(

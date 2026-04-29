@@ -137,7 +137,7 @@ func main() {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	defer cancelFunc()
 
-	r, err := runner.New(ctx, serviceSpecs, reuseportListeners)
+	r, err := runner.New(ctx, serviceSpecs, reuseportListeners, listenWithReuseport)
 	must(err)
 
 	servicesErrCh := make(chan error, len(unversionedSpecs))
@@ -370,25 +370,7 @@ func assignPorts(
 		// To avoid port collisions, set the `so_reuseport_aware` option on the service definition
 		// and use the SO_REUSEPORT socket option in your services.
 		for portName, port := range namedPorts {
-			// We do a bit of a dance here to set SO_LINGER to 0. For details, see
-			// https://stackoverflow.com/questions/71975992/what-really-is-the-linger-time-that-can-be-set-with-so-linger-on-sockets
-			lc := net.ListenConfig{
-				Control: func(network, address string, conn syscall.RawConn) error {
-					var setSockoptErr error
-					err := conn.Control(func(fd uintptr) {
-						setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
-							Onoff:  1,
-							Linger: 0,
-						})
-					})
-					if err != nil {
-						return err
-					}
-					return setSockoptErr
-				},
-			}
-
-			listener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:"+port)
+			listener, err := listenWithReuseport("127.0.0.1:" + port)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -578,6 +560,30 @@ func augmentServiceSpecs(
 type Replacement struct {
 	Old string
 	New string
+}
+
+// listenWithReuseport opens a TCP listener on addr with SO_REUSEPORT set (and
+// SO_LINGER=0 for immediate-close behavior; see
+// https://stackoverflow.com/questions/71975992/what-really-is-the-linger-time-that-can-be-set-with-so-linger-on-sockets).
+// Used for both the initial port-assignment pass and runner-driven rebinds
+// across ibazel restarts.
+func listenWithReuseport(addr string) (net.Listener, error) {
+	lc := net.ListenConfig{
+		Control: func(network, address string, conn syscall.RawConn) error {
+			var setSockoptErr error
+			err := conn.Control(func(fd uintptr) {
+				setSockoptErr = setSockoptsForPortAssignment(fd, &syscall.Linger{
+					Onoff:  1,
+					Linger: 0,
+				})
+			})
+			if err != nil {
+				return err
+			}
+			return setSockoptErr
+		},
+	}
+	return lc.Listen(context.Background(), "tcp", addr)
 }
 
 func buildTestEnv(ports svclib.Ports) ([]string, error) {
